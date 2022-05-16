@@ -483,7 +483,7 @@ func Test_KeyTypes(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(u.Host).ToNot(BeEmpty())
 
-	knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos)
+	knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos, false)
 	g.Expect(err).ToNot(HaveOccurred())
 
 	for _, tt := range tests {
@@ -622,7 +622,7 @@ func Test_KeyExchangeAlgos(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(u.Host).ToNot(BeEmpty())
 
-			knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos)
+			knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos, false)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			// No authentication is required for this test, but it is
@@ -666,6 +666,7 @@ func TestHostKeyAlgos(t *testing.T) {
 		name               string
 		keyType            ssh.KeyPairType
 		ClientHostKeyAlgos []string
+		hashHostNames      bool
 	}{
 		{
 			name:               "support for hostkey: ssh-rsa",
@@ -701,6 +702,48 @@ func TestHostKeyAlgos(t *testing.T) {
 			name:               "support for hostkey: ssh-ed25519",
 			keyType:            ssh.ED25519,
 			ClientHostKeyAlgos: []string{"ssh-ed25519"},
+		},
+		{
+			name:               "support for hostkey: ssh-rsa with hashed host names",
+			keyType:            ssh.RSA_4096,
+			ClientHostKeyAlgos: []string{"ssh-rsa"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: rsa-sha2-256 with hashed host names",
+			keyType:            ssh.RSA_4096,
+			ClientHostKeyAlgos: []string{"rsa-sha2-256"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: rsa-sha2-512 with hashed host names",
+			keyType:            ssh.RSA_4096,
+			ClientHostKeyAlgos: []string{"rsa-sha2-512"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: ecdsa-sha2-nistp256 with hashed host names",
+			keyType:            ssh.ECDSA_P256,
+			ClientHostKeyAlgos: []string{"ecdsa-sha2-nistp256"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: ecdsa-sha2-nistp384 with hashed host names",
+			keyType:            ssh.ECDSA_P384,
+			ClientHostKeyAlgos: []string{"ecdsa-sha2-nistp384"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: ecdsa-sha2-nistp521 with hashed host names",
+			keyType:            ssh.ECDSA_P521,
+			ClientHostKeyAlgos: []string{"ecdsa-sha2-nistp521"},
+			hashHostNames:      true,
+		},
+		{
+			name:               "support for hostkey: ssh-ed25519 with hashed host names",
+			keyType:            ssh.ED25519,
+			ClientHostKeyAlgos: []string{"ssh-ed25519"},
+			hashHostNames:      true,
 		},
 	}
 
@@ -749,7 +792,7 @@ func TestHostKeyAlgos(t *testing.T) {
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(u.Host).ToNot(BeEmpty())
 
-			knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos)
+			knownHosts, err := ssh.ScanHostKey(u.Host, timeout, git.HostKeyAlgos, tt.hashHostNames)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			// No authentication is required for this test, but it is
