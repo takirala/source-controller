@@ -458,28 +458,27 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 	repositoryURL := obj.Spec.URL
 	// managed GIT transport only affects the libgit2 implementation
 	if managed.Enabled() && obj.Spec.GitImplementation == sourcev1.LibGit2Implementation {
-		// At present only HTTP connections have the ability to define remote options.
-		// Although this can be easily extended by ensuring that the fake URL below uses the
-		// target ssh scheme, and the libgit2/managed/ssh.go pulls that information accordingly.
+		// The git2go callback feature is unreliable and can cause the KEX process
+		// to panic. To circumvent it completely, a fake target URL is created to allow
+		// for the smart sub transport to process transport options for this
+		// GitRepository object.
 		//
-		// This is due to the fact the key libgit2 remote callbacks do not take place for HTTP
-		// whilst most still work for SSH.
+		// The URL should use unique information that do not collide in a multi tenant
+		// deployment.
 		if strings.HasPrefix(repositoryURL, "http") {
-			// Due to the lack of the callback feature, a fake target URL is created to allow
-			// for the smart sub transport be able to pick the options specific for this
-			// GitRepository object.
-			// The URL should use unique information that do not collide in a multi tenant
-			// deployment.
 			repositoryURL = fmt.Sprintf("http://%s/%s/%d", obj.Name, obj.UID, obj.Generation)
-			managed.AddTransportOptions(repositoryURL,
-				managed.TransportOptions{
-					TargetURL: obj.Spec.URL,
-					CABundle:  authOpts.CAFile,
-				})
-
-			// We remove the options from memory, to avoid accumulating unused options over time.
-			defer managed.RemoveTransportOptions(repositoryURL)
+		} else {
+			repositoryURL = fmt.Sprintf("ssh://%s/%s/%d", obj.Name, obj.UID, obj.Generation)
 		}
+
+		managed.AddTransportOptions(repositoryURL,
+			managed.TransportOptions{
+				TargetURL: obj.Spec.URL,
+				AuthOpts:  authOpts,
+			})
+
+		// We remove the options from memory, to avoid accumulating unused options over time.
+		defer managed.RemoveTransportOptions(repositoryURL)
 	}
 
 	// Fetch the included artifact metadata.

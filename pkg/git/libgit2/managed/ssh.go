@@ -44,11 +44,16 @@ THE SOFTWARE.
 package managed
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/url"
@@ -57,6 +62,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/net/proxy"
 
 	"github.com/fluxcd/source-controller/pkg/git"
@@ -100,7 +106,21 @@ func (t *sshSmartSubtransport) Action(urlString string, action git2go.SmartServi
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	u, err := url.Parse(urlString)
+	finalUrl := urlString
+	opts, found := transportOptions(urlString)
+	var authOpts *git.AuthOptions
+
+	if found {
+		if opts.TargetURL != "" {
+			// override target URL only if options are found and a new targetURL
+			// is provided.
+			finalUrl = opts.TargetURL
+		}
+
+		authOpts = opts.AuthOpts
+	}
+
+	u, err := url.Parse(finalUrl)
 	if err != nil {
 		return nil, err
 	}
@@ -146,38 +166,32 @@ func (t *sshSmartSubtransport) Action(urlString string, action git2go.SmartServi
 		_ = t.Close()
 	}
 
-	cred, err := t.transport.SmartCredentials("", git2go.CredentialTypeSSHMemory)
-	if err != nil {
-		return nil, err
-	}
-	defer cred.Free()
-
 	port := "22"
 	if u.Port() != "" {
 		port = u.Port()
 	}
 	t.addr = net.JoinHostPort(u.Hostname(), port)
 
-	sshConfig, err := clientConfig(t.addr, cred)
+	sshConfig, err := clientConfig(t.addr, authOpts)
 	if err != nil {
 		return nil, err
 	}
 
 	sshConfig.HostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		marshaledKey := key.Marshal()
+		// There is no point on hashing the key multiple times and
+		// there is no need to support anything but sha256.
+		// This entire logic could become git2go agnostic.
 		cert := &git2go.Certificate{
 			Kind: git2go.CertificateHostkey,
 			Hostkey: git2go.HostkeyCertificate{
-				Kind:         git2go.HostkeySHA1 | git2go.HostkeyMD5 | git2go.HostkeySHA256 | git2go.HostkeyRaw,
-				HashMD5:      md5.Sum(marshaledKey),
-				HashSHA1:     sha1.Sum(marshaledKey),
+				Kind:         git2go.HostkeySHA256,
 				HashSHA256:   sha256.Sum256(marshaledKey),
 				Hostkey:      marshaledKey,
 				SSHPublicKey: key,
 			},
 		}
-
-		return t.transport.SmartCertificateCheck(cert, true, hostname)
+		return knownHostsCallback(hostname, authOpts.KnownHosts)(cert, true, hostname)
 	}
 
 	err = t.createConn(t.addr, sshConfig)
@@ -307,28 +321,17 @@ func (stream *sshSmartSubtransportStream) Free() {
 	traceLog.Info("[ssh]: sshSmartSubtransportStream.Free()")
 }
 
-func clientConfig(remoteAddress string, cred *git2go.Credential) (*ssh.ClientConfig, error) {
+func clientConfig(remoteAddress string, cred *git.AuthOptions) (*ssh.ClientConfig, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("cannot create ssh client config from a nil credential")
 	}
 
-	username, _, privatekey, passphrase, err := cred.GetSSHKey()
-	if err != nil {
-		return nil, err
-	}
-
-	var pemBytes []byte
-	if cred.Type() == git2go.CredentialTypeSSHMemory {
-		pemBytes = []byte(privatekey)
-	} else {
-		return nil, fmt.Errorf("file based SSH credential is not supported")
-	}
-
 	var key ssh.Signer
-	if passphrase != "" {
-		key, err = ssh.ParsePrivateKeyWithPassphrase(pemBytes, []byte(passphrase))
+	var err error
+	if cred.Password != "" {
+		key, err = ssh.ParsePrivateKeyWithPassphrase(cred.Identity, []byte(cred.Password))
 	} else {
-		key, err = ssh.ParsePrivateKey(pemBytes)
+		key, err = ssh.ParsePrivateKey(cred.Identity)
 	}
 
 	if err != nil {
@@ -336,7 +339,7 @@ func clientConfig(remoteAddress string, cred *git2go.Credential) (*ssh.ClientCon
 	}
 
 	cfg := &ssh.ClientConfig{
-		User:    username,
+		User:    cred.Username,
 		Auth:    []ssh.AuthMethod{ssh.PublicKeys(key)},
 		Timeout: sshConnectionTimeOut,
 	}
@@ -348,4 +351,162 @@ func clientConfig(remoteAddress string, cred *git2go.Credential) (*ssh.ClientCon
 	}
 
 	return cfg, nil
+}
+
+/// Below comes from libgit2.Transport, and should be moved into fluxcd/pkg/ssh
+
+// knownHostCallback returns a CertificateCheckCallback that verifies
+// the key of Git server against the given host and known_hosts for
+// git.SSH Transports.
+func knownHostsCallback(host string, knownHosts []byte) git2go.CertificateCheckCallback {
+	return func(cert *git2go.Certificate, valid bool, hostname string) error {
+		kh, err := parseKnownHosts(string(knownHosts))
+		if err != nil {
+			return fmt.Errorf("failed to parse known_hosts: %w", err)
+		}
+
+		// First, attempt to split the configured host and port to validate
+		// the port-less hostname given to the callback.
+		hostWithoutPort, _, err := net.SplitHostPort(host)
+		if err != nil {
+			// SplitHostPort returns an error if the host is missing
+			// a port, assume the host has no port.
+			hostWithoutPort = host
+		}
+
+		// Different versions of libgit handle this differently.
+		// This fixes the case in which ports may be sent back.
+		hostnameWithoutPort, _, err := net.SplitHostPort(hostname)
+		if err != nil {
+			hostnameWithoutPort = hostname
+		}
+
+		if hostnameWithoutPort != hostWithoutPort {
+			return fmt.Errorf("host mismatch: %q %q", hostWithoutPort, hostnameWithoutPort)
+		}
+
+		// We are now certain that the configured host and the hostname
+		// given to the callback match. Use the configured host (that
+		// includes the port), and normalize it, so we can check if there
+		// is an entry for the hostname _and_ port.
+		h := knownhosts.Normalize(host)
+		for _, k := range kh {
+			if k.matches(h, cert.Hostkey) {
+				return nil
+			}
+		}
+		return fmt.Errorf("hostkey could not be verified")
+	}
+}
+
+type knownKey struct {
+	hosts []string
+	key   ssh.PublicKey
+}
+
+func parseKnownHosts(s string) ([]knownKey, error) {
+	var knownHosts []knownKey
+	scanner := bufio.NewScanner(strings.NewReader(s))
+	for scanner.Scan() {
+		_, hosts, pubKey, _, _, err := ssh.ParseKnownHosts(scanner.Bytes())
+		if err != nil {
+			// Lines that aren't host public key result in EOF, like a comment
+			// line. Continue parsing the other lines.
+			if err == io.EOF {
+				continue
+			}
+			return []knownKey{}, err
+		}
+
+		knownHost := knownKey{
+			hosts: hosts,
+			key:   pubKey,
+		}
+		knownHosts = append(knownHosts, knownHost)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return []knownKey{}, err
+	}
+
+	return knownHosts, nil
+}
+
+func (k knownKey) matches(host string, hostkey git2go.HostkeyCertificate) bool {
+	if !containsHost(k.hosts, host) {
+		return false
+	}
+
+	var fingerprint []byte
+	var hasher hash.Hash
+
+	//DEPRECATE insecure algos MD5/SHA1
+	switch {
+	case hostkey.Kind&git2go.HostkeySHA256 > 0:
+		fingerprint = hostkey.HashSHA256[:]
+		hasher = sha256.New()
+	case hostkey.Kind&git2go.HostkeySHA1 > 0:
+		fingerprint = hostkey.HashSHA1[:]
+		hasher = sha1.New()
+	case hostkey.Kind&git2go.HostkeyMD5 > 0:
+		fingerprint = hostkey.HashMD5[:]
+		hasher = md5.New()
+	default:
+		return false
+	}
+	hasher.Write(k.key.Marshal())
+	return bytes.Equal(hasher.Sum(nil), fingerprint)
+}
+
+func containsHost(hosts []string, host string) bool {
+	for _, kh := range hosts {
+		// hashed host must start with a pipe
+		if kh[0] == '|' {
+			match, _ := MatchHashedHost(kh, host)
+			if match {
+				return true
+			}
+
+		} else if kh == host { // unhashed host check
+			return true
+		}
+	}
+	return false
+}
+
+// MatchHashedHost tries to match a hashed known host (kh) to
+// host.
+//
+// Note that host is not hashed, but it is rather hashed during
+// the matching process using the same salt used when hashing
+// the known host.
+func MatchHashedHost(kh, host string) (bool, error) {
+	if kh == "" || kh[0] != '|' {
+		return false, fmt.Errorf("hashed known host must begin with '|': '%s'", kh)
+	}
+
+	components := strings.Split(kh, "|")
+	if len(components) != 4 {
+		return false, fmt.Errorf("invalid format for hashed known host: '%s'", kh)
+	}
+
+	if components[1] != "1" {
+		return false, fmt.Errorf("unsupported hash type '%s'", components[1])
+	}
+
+	hkSalt, err := base64.StdEncoding.DecodeString(components[2])
+	if err != nil {
+		return false, fmt.Errorf("cannot decode hashed known host: '%w'", err)
+	}
+
+	hkHash, err := base64.StdEncoding.DecodeString(components[3])
+	if err != nil {
+		return false, fmt.Errorf("cannot decode hashed known host: '%w'", err)
+	}
+
+	mac := hmac.New(sha1.New, hkSalt)
+	mac.Write([]byte(host))
+	hostHash := mac.Sum(nil)
+
+	return bytes.Equal(hostHash, hkHash), nil
 }

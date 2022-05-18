@@ -160,9 +160,9 @@ func createClientRequest(targetUrl string, action git2go.SmartServiceAction, t *
 		}
 
 		// Add any provided certificate to the http transport.
-		if len(opts.CABundle) > 0 {
+		if opts.AuthOpts != nil && len(opts.AuthOpts.CAFile) > 0 {
 			cap := x509.NewCertPool()
-			if ok := cap.AppendCertsFromPEM(opts.CABundle); !ok {
+			if ok := cap.AppendCertsFromPEM(opts.AuthOpts.CAFile); !ok {
 				return nil, nil, fmt.Errorf("failed to use certificate from PEM")
 			}
 			t.TLSClientConfig = &tls.Config{
@@ -209,6 +209,11 @@ func createClientRequest(targetUrl string, action git2go.SmartServiceAction, t *
 		return nil, nil, err
 	}
 
+	if opts.AuthOpts != nil {
+		// Extra validation required or is this already done before this point?
+		req.SetBasicAuth(opts.AuthOpts.Username, opts.AuthOpts.Password)
+	}
+
 	req.Header.Set("User-Agent", "git/2.0 (flux-libgit2)")
 	return client, req, nil
 }
@@ -239,7 +244,6 @@ type httpSmartSubtransportStream struct {
 	recvReply   sync.WaitGroup
 	httpError   error
 	m           sync.RWMutex
-	targetURL   string
 }
 
 func newManagedHttpStream(owner *httpSmartSubtransport, req *http.Request, client *http.Client) *httpSmartSubtransportStream {
@@ -324,27 +328,6 @@ func (self *httpSmartSubtransportStream) sendRequest() error {
 
 	var resp *http.Response
 	var err error
-	var userName string
-	var password string
-
-	// Obtain the credentials and use them if available.
-	cred, err := self.owner.transport.SmartCredentials("", git2go.CredentialTypeUserpassPlaintext)
-	if err != nil {
-		// Passthrough error indicates that no credentials were provided.
-		// Continue without credentials.
-		if err.Error() != git2go.ErrorCodePassthrough.String() {
-			return err
-		}
-	}
-
-	if cred != nil {
-		defer cred.Free()
-
-		userName, password, err = cred.GetUserpassPlaintext()
-		if err != nil {
-			return err
-		}
-	}
 
 	var content []byte
 	for {
@@ -365,7 +348,6 @@ func (self *httpSmartSubtransportStream) sendRequest() error {
 			req.ContentLength = -1
 		}
 
-		req.SetBasicAuth(userName, password)
 		traceLog.Info("[http]: new request", "method", req.Method, "URL", req.URL)
 		resp, err = self.client.Do(req)
 		if err != nil {

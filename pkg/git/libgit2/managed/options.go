@@ -18,13 +18,15 @@ package managed
 
 import (
 	"sync"
+
+	"github.com/fluxcd/source-controller/pkg/git"
 )
 
 // TransportOptions represents options to be applied at transport-level
 // at request time.
 type TransportOptions struct {
 	TargetURL string
-	CABundle  []byte
+	AuthOpts  *git.AuthOptions
 }
 
 var (

@@ -155,12 +155,16 @@ func TestOptions(t *testing.T) {
 			url:          "https://target/?876",
 			opts: TransportOptions{
 				TargetURL: "https://new-target/321",
-				CABundle:  []byte{123, 213, 132},
+				AuthOpts: &git.AuthOptions{
+					CAFile: []byte{123, 213, 132},
+				},
 			},
 			expectOpts: true,
 			expectedOpts: &TransportOptions{
 				TargetURL: "https://new-target/321",
-				CABundle:  []byte{123, 213, 132},
+				AuthOpts: &git.AuthOptions{
+					CAFile: []byte{123, 213, 132},
+				},
 			},
 		},
 		{
